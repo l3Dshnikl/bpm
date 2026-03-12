@@ -16,23 +16,36 @@ import kotlin.math.sqrt
 /**
  * Manages microphone recording and energy-based beat onset detection.
  *
- * Algorithm (pure Kotlin, no external libraries):
- * 1. Record 16-bit PCM mono at 44100 Hz via AudioRecord.
- * 2. Process overlapping frames (frame=1024 samples, hop=512 samples, ~23 ms each).
- * 3. Compute RMS energy per frame.
- * 4. Maintain a ~1-second sliding window of RMS history (43 frames).
- * 5. Detect an onset when RMS > mean(history) × 1.5 AND ≥300 ms since last onset.
- * 6. Track the last 8 onset timestamps; emit BPM via StateFlow on each new onset.
+ * Pipeline per audio hop (~11 ms):
+ *  1. Read HOP_SIZE 16-bit PCM samples from AudioRecord.
+ *  2. Compute RMS energy of the hop using a tight for-loop (zero allocation).
+ *  3. Apply EMA smoothing to suppress single-sample noise spikes.
+ *  4. Maintain a ~1-second FloatArray circular buffer of smoothed RMS values.
+ *  5. Detect an onset when:
+ *       a. smoothedRms is RISING (derivative > 0) — prevents decay-tail triggers
+ *       b. smoothedRms > mean(history) × ONSET_THRESHOLD
+ *       c. ≥ REFRACTORY_MS since the last raw onset
+ *  6. Pass each valid raw onset to TempoTracker, which filters subdivisions and
+ *     compensates for missed beats before updating the BPM StateFlow.
+ *
+ * Genre robustness summary:
+ *  - Rock/EDM:   snare/hi-hat subdivisions (2×/4×) filtered by TempoTracker
+ *  - Jazz:       missed beats compensated; EMA + derivative suppresses brush noise
+ *  - Classical:  large-deviation onsets discarded; estimate preserved
+ *  - Slow (40 BPM): 1-second history window covers the full beat period
+ *  - Fast (240 BPM): 250 ms refractory ceiling supports Prestissimo
  */
 class AudioEngine(private val scope: CoroutineScope) {
 
     companion object {
         private const val SAMPLE_RATE = 44_100
-        private const val HOP_SIZE = 512
-        private const val HISTORY_FRAMES = 43       // ~1 second of RMS history
-        private const val ONSET_THRESHOLD = 1.5f    // multiplier over mean energy
-        private const val REFRACTORY_MS = 300L      // min ms between onsets
-        private const val ONSET_BUFFER_SIZE = 8     // onsets kept for BPM averaging
+        private const val HOP_SIZE = 512              // ~11.6 ms per hop
+        private const val HISTORY_FRAMES = 86         // ~1 s of RMS history (fix: was 43 ≈ 0.5 s)
+        private const val ONSET_THRESHOLD = 1.5f      // multiplier over mean energy
+        private const val REFRACTORY_MS = 250L        // fix: was 300 → supports up to 240 BPM
+        private const val EMA_ALPHA = 0.3f            // exponential smoothing coefficient
+        private const val BPM_MIN = 40.0
+        private const val BPM_MAX = 240.0
     }
 
     private val _bpmFlow = MutableStateFlow(0.0)
@@ -78,35 +91,66 @@ class AudioEngine(private val scope: CoroutineScope) {
 
     private suspend fun processAudio(record: AudioRecord) {
         val pcmBuffer = ShortArray(HOP_SIZE)
-        val rmsHistory = ArrayDeque<Float>()
-        val onsetTimestamps = ArrayDeque<Long>()
-        var lastOnsetMs = 0L
+
+        // Zero-allocation circular buffer for RMS history (fix: was ArrayDeque<Float> → boxing)
+        val rmsHistory = FloatArray(HISTORY_FRAMES)
+        var historyHead = 0
+        var historyFilled = 0
+
+        val tempoTracker = TempoTracker()
+        var smoothedRms = 0f
+        var prevSmoothedRms = 0f
+        var lastRawOnsetMs = 0L
 
         while (isActive && record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
             val read = record.read(pcmBuffer, 0, HOP_SIZE)
             if (read <= 0) continue
 
-            // Compute RMS energy for this hop
-            val sumSq = pcmBuffer.take(read).sumOf { it.toLong() * it.toLong() }
+            // ── RMS via plain loop — zero allocation (fix: was pcmBuffer.take(read).sumOf{...})
+            var sumSq = 0L
+            for (i in 0 until read) {
+                val s = pcmBuffer[i].toLong()
+                sumSq += s * s
+            }
             val rms = sqrt(sumSq.toDouble() / read).toFloat()
 
-            rmsHistory.addLast(rms)
-            if (rmsHistory.size > HISTORY_FRAMES) rmsHistory.removeFirst()
+            // ── EMA smoothing: reduces single-sample noise spikes
+            smoothedRms = EMA_ALPHA * rms + (1f - EMA_ALPHA) * smoothedRms
 
-            if (rmsHistory.size < HISTORY_FRAMES) continue
+            // ── Store in circular buffer
+            rmsHistory[historyHead] = smoothedRms
+            historyHead = (historyHead + 1) % HISTORY_FRAMES
+            if (historyFilled < HISTORY_FRAMES) historyFilled++
 
-            val meanEnergy = rmsHistory.average().toFloat()
+            // Wait until history is warm
+            if (historyFilled < HISTORY_FRAMES) {
+                prevSmoothedRms = smoothedRms
+                continue
+            }
+
+            // ── Mean of history (used as adaptive baseline)
+            var sum = 0f
+            for (v in rmsHistory) sum += v
+            val meanEnergy = sum / HISTORY_FRAMES
+
             val now = SystemClock.elapsedRealtime()
 
-            if (rms > meanEnergy * ONSET_THRESHOLD && (now - lastOnsetMs) > REFRACTORY_MS) {
-                lastOnsetMs = now
-                onsetTimestamps.addLast(now)
-                if (onsetTimestamps.size > ONSET_BUFFER_SIZE) onsetTimestamps.removeFirst()
-
-                if (onsetTimestamps.size >= 2) {
-                    _bpmFlow.value = BpmCalculator.calculateBpmFromOnsets(onsetTimestamps)
+            // ── Onset conditions:
+            //    a) energy is rising (derivative check — prevents decay-tail triggers)
+            //    b) exceeds adaptive threshold
+            //    c) outside refractory window
+            if (smoothedRms > prevSmoothedRms
+                && smoothedRms > meanEnergy * ONSET_THRESHOLD
+                && (now - lastRawOnsetMs) > REFRACTORY_MS
+            ) {
+                lastRawOnsetMs = now
+                val bpm = tempoTracker.processOnset(now)
+                if (bpm in BPM_MIN..BPM_MAX) {
+                    _bpmFlow.value = bpm
                 }
             }
+
+            prevSmoothedRms = smoothedRms
         }
     }
 

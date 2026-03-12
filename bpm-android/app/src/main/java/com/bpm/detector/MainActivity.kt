@@ -1,6 +1,7 @@
 package com.bpm.detector
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -10,6 +11,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import com.bpm.detector.ui.MainScreen
 import com.bpm.detector.ui.theme.BpmDetectorTheme
 import com.bpm.detector.viewmodel.BpmViewModel
@@ -28,6 +30,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Notify the ViewModel of any permission already granted from a previous session.
+        // Without this, the mic tab always shows "Grant Permission" on relaunch even though
+        // RECORD_AUDIO was granted before.
+        val alreadyGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (alreadyGranted) viewModel.onMicPermissionResult(true)
 
         setContent {
             BpmDetectorTheme {

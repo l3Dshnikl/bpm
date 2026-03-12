@@ -99,7 +99,14 @@ class BpmViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onMicPermissionResult(granted: Boolean) {
         _micUiState.update { it.copy(permissionGranted = granted) }
-        if (granted) audioEngine.start()
+        // Auto-start only when the mic tab is active and the engine isn't already running.
+        // Prevents the engine from starting in the background while the user is on the Tap tab.
+        if (granted
+            && _selectedMode.value == DetectionMode.MICROPHONE
+            && !audioEngine.isRecording.value
+        ) {
+            audioEngine.start()
+        }
     }
 
     fun startMic() {
